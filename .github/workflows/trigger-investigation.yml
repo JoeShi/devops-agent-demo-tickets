@@ -5,79 +5,104 @@ on:
     types: [opened]
 
 permissions:
-  id-token: write   # required for OIDC
-  issues: write     # required to post comments
+  issues: write     # post comments back
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Trigger DevOps Agent investigation
-        id: create_task
+      - name: Send incident event to DevOps Agent Webhook
+        id: send_event
         env:
-          AGENT_SPACE_ID: ${{ secrets.DEVOPS_AGENT_SPACE_ID }}
+          WEBHOOK_URL:    ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
           ISSUE_NUMBER:   ${{ github.event.issue.number }}
           ISSUE_TITLE:    ${{ github.event.issue.title }}
           ISSUE_BODY:     ${{ github.event.issue.body }}
           ISSUE_URL:      ${{ github.event.issue.html_url }}
           REPO:           ${{ github.repository }}
-          AWS_REGION:     ${{ secrets.AWS_REGION }}
+          LABELS_JSON:    ${{ toJson(github.event.issue.labels) }}
         run: |
-          # Map GitHub label to DevOps Agent priority
-          LABELS='${{ toJson(github.event.issue.labels) }}'
+          set -euo pipefail
+
+          # Map GitHub label → DevOps Agent priority (CRITICAL | HIGH | MEDIUM | LOW | MINIMAL)
           PRIORITY="MEDIUM"
-          if echo "$LABELS" | grep -qi "critical"; then PRIORITY="CRITICAL"
-          elif echo "$LABELS" | grep -qi "high";     then PRIORITY="HIGH"
-          elif echo "$LABELS" | grep -qi "low";      then PRIORITY="LOW"
+          if   echo "$LABELS_JSON" | grep -qi "\"name\": *\"critical\""; then PRIORITY="CRITICAL"
+          elif echo "$LABELS_JSON" | grep -qi "\"name\": *\"high\"";     then PRIORITY="HIGH"
+          elif echo "$LABELS_JSON" | grep -qi "\"name\": *\"low\"";      then PRIORITY="LOW"
           fi
 
-          # Build description (truncate body to 2000 chars)
-          DESCRIPTION=$(printf '%s\n\n**GitHub Issue:** %s' \
-            "$(echo "$ISSUE_BODY" | head -c 2000)" \
-            "$ISSUE_URL")
+          # Build payload matching the Agent Space Webhook schema
+          # (eventType / incidentId / action / priority / title / description / timestamp / service / data)
+          # incidentId uses <repo>#<number> so downstream Lambda can correlate back to the issue.
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          INCIDENT_ID="${REPO}#${ISSUE_NUMBER}"
 
-          # Build --reference as JSON to avoid shorthand parsing issues with
-          # special chars (spaces, brackets, slashes) in title/url.
-          # associationId must match ^[a-zA-Z0-9_.-]+$ (no slashes).
-          REFERENCE=$(python3 -c 'import json, os; print(json.dumps({"system": "github", "title": os.environ["ISSUE_TITLE"], "referenceId": os.environ["ISSUE_NUMBER"], "referenceUrl": os.environ["ISSUE_URL"], "associationId": os.environ["REPO"].replace("/", "__")}))')
+          PAYLOAD=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              "eventType":   "incident",
+              "incidentId":  os.environ["INCIDENT_ID"],
+              "action":      "created",
+              "priority":    os.environ["PRIORITY"],
+              "title":       os.environ["ISSUE_TITLE"],
+              "description": (os.environ.get("ISSUE_BODY") or "")[:2000],
+              "timestamp":   os.environ["TIMESTAMP"],
+              "service":     "github-issues",
+              "data": {
+                  "githubIssue": {
+                      "repo":    os.environ["REPO"],
+                      "number":  int(os.environ["ISSUE_NUMBER"]),
+                      "htmlUrl": os.environ["ISSUE_URL"],
+                  }
+              },
+          }))
+          PY
+          )
+          export INCIDENT_ID TIMESTAMP PRIORITY
+          # note: python receives env; the heredoc is quoted ('PY') so no shell interpolation
 
-          RESULT=$(aws devops-agent create-backlog-task \
-            --region "$AWS_REGION" \
-            --agent-space-id "$AGENT_SPACE_ID" \
-            --task-type INVESTIGATION \
-            --title "$ISSUE_TITLE" \
-            --description "$DESCRIPTION" \
-            --priority "$PRIORITY" \
-            --reference "$REFERENCE" \
-            --output json)
+          # HMAC-SHA256(timestamp:payload, secret) base64 encoded
+          SIGNATURE=$(printf '%s:%s' "$TIMESTAMP" "$PAYLOAD" \
+                      | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
 
-          TASK_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['taskId'])")
-          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
-          echo "Created investigation task: $TASK_ID"
+          echo "::group::Request"
+          echo "URL:           $WEBHOOK_URL"
+          echo "Timestamp:     $TIMESTAMP"
+          echo "Incident ID:   $INCIDENT_ID"
+          echo "Priority:      $PRIORITY"
+          echo "Payload bytes: ${#PAYLOAD}"
+          echo "::endgroup::"
 
-          # Store task_id → issue mapping in SSM so investigation_notifier Lambda
-          # can route EventBridge events back to this issue
-          aws ssm put-parameter \
-            --region "$AWS_REGION" \
-            --name "/devops-agent/task/${TASK_ID}/github-issue" \
-            --value "${REPO}#${ISSUE_NUMBER}" \
-            --type String \
-            --overwrite
+          HTTP_CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-amzn-event-timestamp: $TIMESTAMP" \
+            -H "x-amzn-event-signature: $SIGNATURE" \
+            -d "$PAYLOAD")
+
+          echo "HTTP $HTTP_CODE"
+          echo "Response body:"
+          cat /tmp/resp.json || true
+          echo
+
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
+            echo "::error::Webhook returned $HTTP_CODE"
+            exit 1
+          fi
+
+          # Expose for next step (note: secrets/payload NOT exposed)
+          {
+            echo "incident_id=$INCIDENT_ID"
+            echo "http_code=$HTTP_CODE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Post initial comment on issue
         uses: actions/github-script@v7
         with:
           script: |
-            const taskId = '${{ steps.create_task.outputs.task_id }}';
-            const region = '${{ secrets.AWS_REGION }}';
-            const spaceId = '${{ secrets.DEVOPS_AGENT_SPACE_ID }}';
-            const invUrl = `https://${region}.console.aws.amazon.com/aidevops/agent-spaces/${spaceId}/investigations/${taskId}`;
+            const incidentId = '${{ steps.send_event.outputs.incident_id }}';
+            const httpCode   = '${{ steps.send_event.outputs.http_code }}';
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -85,8 +110,9 @@ jobs:
               body: [
                 '## DevOps Agent 调查已触发',
                 '',
-                `- **Task ID**: \`${taskId}\``,
-                `- **状态**: 调查请求已提交，等待处理`,
+                `- **Incident ID**: \`${incidentId}\``,
+                `- **Webhook 响应**: HTTP ${httpCode}`,
+                `- **状态**: 调查请求已提交，等待 DevOps Agent 处理`,
                 '',
                 `后续状态更新将自动写入此 issue 的 comments 中。`,
               ].join('\n'),
