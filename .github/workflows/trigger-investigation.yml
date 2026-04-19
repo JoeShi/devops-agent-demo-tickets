@@ -37,6 +37,7 @@ jobs:
           # incidentId uses <repo>#<number> so downstream Lambda can correlate back to the issue.
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
           INCIDENT_ID="${REPO}#${ISSUE_NUMBER}"
+          export TIMESTAMP INCIDENT_ID PRIORITY
 
           PAYLOAD=$(python3 - <<'PY'
           import json, os
@@ -59,8 +60,6 @@ jobs:
           }))
           PY
           )
-          export INCIDENT_ID TIMESTAMP PRIORITY
-          # note: python receives env; the heredoc is quoted ('PY') so no shell interpolation
 
           # HMAC-SHA256(timestamp:payload, secret) base64 encoded
           SIGNATURE=$(printf '%s:%s' "$TIMESTAMP" "$PAYLOAD" \
