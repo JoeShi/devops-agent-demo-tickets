@@ -44,15 +44,7 @@ jobs:
 
           # Build --reference as JSON to avoid shorthand parsing issues with
           # special chars (spaces, brackets, slashes) in title/url.
-          REFERENCE=$(python3 -c '
-import json, os
-print(json.dumps({
-    "system": "github",
-    "title": os.environ["ISSUE_TITLE"],
-    "referenceId": os.environ["ISSUE_NUMBER"],
-    "referenceUrl": os.environ["ISSUE_URL"],
-    "associationId": os.environ["REPO"],
-}))')
+          REFERENCE=$(python3 -c 'import json, os; print(json.dumps({"system": "github", "title": os.environ["ISSUE_TITLE"], "referenceId": os.environ["ISSUE_NUMBER"], "referenceUrl": os.environ["ISSUE_URL"], "associationId": os.environ["REPO"]}))')
 
           RESULT=$(aws devops-agent create-backlog-task \
             --region "$AWS_REGION" \
