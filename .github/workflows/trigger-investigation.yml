@@ -1,0 +1,89 @@
+name: Trigger DevOps Agent Investigation
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  id-token: write   # required for OIDC
+  issues: write     # required to post comments
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Trigger DevOps Agent investigation
+        id: create_task
+        env:
+          AGENT_SPACE_ID: ${{ secrets.DEVOPS_AGENT_SPACE_ID }}
+          ISSUE_NUMBER:   ${{ github.event.issue.number }}
+          ISSUE_TITLE:    ${{ github.event.issue.title }}
+          ISSUE_BODY:     ${{ github.event.issue.body }}
+          ISSUE_URL:      ${{ github.event.issue.html_url }}
+          REPO:           ${{ github.repository }}
+          AWS_REGION:     ${{ secrets.AWS_REGION }}
+        run: |
+          # Map GitHub label to DevOps Agent priority
+          LABELS='${{ toJson(github.event.issue.labels) }}'
+          PRIORITY="MEDIUM"
+          if echo "$LABELS" | grep -qi "critical"; then PRIORITY="CRITICAL"
+          elif echo "$LABELS" | grep -qi "high";     then PRIORITY="HIGH"
+          elif echo "$LABELS" | grep -qi "low";      then PRIORITY="LOW"
+          fi
+
+          # Build description (truncate body to 2000 chars)
+          DESCRIPTION=$(printf '%s\n\n**GitHub Issue:** %s' \
+            "$(echo "$ISSUE_BODY" | head -c 2000)" \
+            "$ISSUE_URL")
+
+          RESULT=$(aws devops-agent create-backlog-task \
+            --region "$AWS_REGION" \
+            --agent-space-id "$AGENT_SPACE_ID" \
+            --task-type INVESTIGATION \
+            --title "$ISSUE_TITLE" \
+            --description "$DESCRIPTION" \
+            --priority "$PRIORITY" \
+            --reference \
+              "system=github,title=${ISSUE_TITLE},referenceId=${ISSUE_NUMBER},referenceUrl=${ISSUE_URL},associationId=${REPO}" \
+            --output json)
+
+          TASK_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['taskId'])")
+          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
+          echo "Created investigation task: $TASK_ID"
+
+          # Store task_id → issue mapping in SSM so investigation_notifier Lambda
+          # can route EventBridge events back to this issue
+          aws ssm put-parameter \
+            --region "$AWS_REGION" \
+            --name "/devops-agent/task/${TASK_ID}/github-issue" \
+            --value "${REPO}#${ISSUE_NUMBER}" \
+            --type String \
+            --overwrite
+
+      - name: Post initial comment on issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const taskId = '${{ steps.create_task.outputs.task_id }}';
+            const region = '${{ secrets.AWS_REGION }}';
+            const spaceId = '${{ secrets.DEVOPS_AGENT_SPACE_ID }}';
+            const invUrl = `https://${region}.console.aws.amazon.com/aidevops/agent-spaces/${spaceId}/investigations/${taskId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## DevOps Agent 调查已触发',
+                '',
+                `- **Task ID**: \`${taskId}\``,
+                `- **状态**: 调查请求已提交，等待处理`,
+                '',
+                `后续状态更新将自动写入此 issue 的 comments 中。`,
+              ].join('\n'),
+            });
